@@ -1,0 +1,123 @@
+Subject: [PATCH] net: mvneta: diagnose MOX PCS state
+
+Capture bounded PCS status changes even when the link stays down,
+without changing MAC AN bypass. Record MAC AN configuration and
+link-up registers, plus up to four MAC RX CRC/PCS sync events, then
+restore the normal interrupt mask. This is a temporary diagnostic patch,
+not a fix.
+
+---
+ drivers/net/ethernet/marvell/mvneta.c | 58 +++++++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 55 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -180,5 +180,8 @@
+ #define      MVNETA_CAUSE_SERDES_SYNC_ERR        BIT(14)
+ 
++#define MVNETA_MOX_RX_DIAG_MASK (MVNETA_CAUSE_RX_CRC_ERROR | \
++		MVNETA_CAUSE_PSC_SYNC_CHANGE | MVNETA_CAUSE_SERDES_SYNC_ERR)
++
+ #define      MVNETA_CAUSE_BMU_ALLOC_ERR_SHIFT    16
+ #define      MVNETA_CAUSE_BMU_ALLOC_ERR_ALL_MASK   (0xF << MVNETA_CAUSE_BMU_ALLOC_ERR_SHIFT)
+ #define      MVNETA_CAUSE_BMU_ALLOC_ERR_MASK(pool) (1 << (MVNETA_CAUSE_BMU_ALLOC_ERR_SHIFT + (pool)))
+@@ -533,6 +536,9 @@ struct mvneta_port {
+ 	u16 rx_ring_size;
+ 
+ 	phy_interface_t phy_interface;
++	u8 mox_rx_events;
++	u8 mox_an_samples;
++	u32 mox_last_status;
+ 	struct device_node *dn;
+ 	unsigned int tx_csum_limit;
+ 	struct phylink *phylink;
+@@ -3297,6 +3303,17 @@ static int mvneta_poll(struct napi_struct
+ 	if (cause_rx_tx & MVNETA_MISCINTR_INTR_MASK) {
+ 		u32 cause_misc = mvreg_read(pp, MVNETA_INTR_MISC_CAUSE);
+ 
++		if ((cause_misc & MVNETA_MOX_RX_DIAG_MASK) &&
++		    pp->mox_rx_events < 4 &&
++		    pp->phy_interface == PHY_INTERFACE_MODE_2500BASEX &&
++		    of_machine_is_compatible("cznic,turris-mox")) {
++			netdev_info(pp->dev, "MOX MAC RX event: cause=%#x status=%#x\n",
++				    cause_misc, mvreg_read(pp, MVNETA_GMAC_STATUS));
++			if (++pp->mox_rx_events == 4)
++				mvreg_write(pp, MVNETA_INTR_MISC_MASK,
++					    MVNETA_CAUSE_PHY_STATUS_CHANGE |
++					    MVNETA_CAUSE_LINK_CHANGE);
++		}
+ 		mvreg_write(pp, MVNETA_INTR_MISC_CAUSE, 0);
+ 
+ 		if (cause_misc & (MVNETA_CAUSE_PHY_STATUS_CHANGE |
+@@ -3756,5 +3773,7 @@ static void mvneta_start_dev(struct mvne
+ {
+ 	int cpu;
++	u32 misc_mask = MVNETA_CAUSE_PHY_STATUS_CHANGE |
++			MVNETA_CAUSE_LINK_CHANGE;
+ 
+ 	WARN_ON(mvneta_config_interface(pp, pp->phy_interface));
+ 
+@@ -3779,9 +3798,12 @@ static void mvneta_start_dev(struct mvne
+ 	/* Unmask interrupts. It has to be done from each CPU */
+ 	on_each_cpu(mvneta_percpu_unmask_interrupt, pp, true);
+ 
+-	mvreg_write(pp, MVNETA_INTR_MISC_MASK,
+-		    MVNETA_CAUSE_PHY_STATUS_CHANGE |
+-		    MVNETA_CAUSE_LINK_CHANGE);
++	pp->mox_rx_events = 0;
++	pp->mox_an_samples = 0;
++	if (pp->phy_interface == PHY_INTERFACE_MODE_2500BASEX &&
++	    of_machine_is_compatible("cznic,turris-mox"))
++		misc_mask |= MVNETA_MOX_RX_DIAG_MASK;
++	mvreg_write(pp, MVNETA_INTR_MISC_MASK, misc_mask);
+ 
+ 	phylink_start(pp->phylink);
+ 
+@@ -3998,6 +4020,19 @@ static void mvneta_pcs_get_state(struct
+ 	u32 gmac_stat;
+ 
+ 	gmac_stat = mvreg_read(pp, MVNETA_GMAC_STATUS);
++	if (state->interface == PHY_INTERFACE_MODE_2500BASEX &&
++	    of_machine_is_compatible("cznic,turris-mox") &&
++	    pp->mox_an_samples < 8 &&
++	    (!pp->mox_an_samples || pp->mox_last_status != gmac_stat)) {
++		pp->mox_last_status = gmac_stat;
++		pp->mox_an_samples++;
++		netdev_info(pp->dev,
++			    "MOX MAC PCS state: AN=%#x STATUS=%#x CTRL0=%#x CTRL2=%#x CLOCK=%#x\n",
++			    mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG), gmac_stat,
++			    mvreg_read(pp, MVNETA_GMAC_CTRL_0),
++			    mvreg_read(pp, MVNETA_GMAC_CTRL_2),
++			    mvreg_read(pp, MVNETA_GMAC_CLOCK_DIVIDER));
++	}
+ 
+ 	if (gmac_stat & MVNETA_GMAC_SPEED_1000)
+ 		state->speed =
+@@ -4064,5 +4099,12 @@ static int mvneta_pcs_config(struct phyli
+ 	if (changed)
+ 		mvreg_write(pp, MVNETA_GMAC_AUTONEG_CONFIG, an);
+ 
++	if (interface == PHY_INTERFACE_MODE_2500BASEX &&
++	    of_machine_is_compatible("cznic,turris-mox"))
++		netdev_info(pp->dev,
++			    "MOX MAC PCS config: mode=%#x AN before=%#x requested=%#x readback=%#x\n",
++			    neg_mode, old_an, an,
++			    mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG));
++
+ 	/* We are only interested in the advertisement bits changing */
+ 	return !!(changed & MVNETA_GMAC_ADVERT_SYM_FLOW_CTRL);
+@@ -4285,4 +4327,14 @@ static void mvneta_mac_link_up(struct ph
+ 	}
+ 
+ 	mvneta_port_up(pp);
++
++	if (of_machine_is_compatible("cznic,turris-mox") &&
++	    interface == PHY_INTERFACE_MODE_2500BASEX)
++		netdev_info(ndev,
++			    "link registers: CTRL0=%#x CTRL2=%#x AN=%#x STATUS=%#x CTRL4=%#x\n",
++			    mvreg_read(pp, MVNETA_GMAC_CTRL_0),
++			    mvreg_read(pp, MVNETA_GMAC_CTRL_2),
++			    mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG),
++			    mvreg_read(pp, MVNETA_GMAC_STATUS),
++			    mvreg_read(pp, MVNETA_GMAC_CTRL_4));
+ }

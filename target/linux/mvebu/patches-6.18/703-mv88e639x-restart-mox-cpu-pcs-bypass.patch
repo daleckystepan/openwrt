@@ -1,0 +1,193 @@
+Subject: [PATCH] net: dsa: mv88e6xxx: diagnose MOX CPU PCS AN
+
+The MOX switch0 CPU port links in 2500BASE-X AN bypass: the PCS BMCR
+enables AN, but BMSR never reports completion and the SoC receives CRC
+errors. Allow a manual userspace-triggered switch PCS AN restart without
+automatically changing negotiation in the state reader. Log the programmed AN
+mode and BMCR as well. Observe whether the switch PCS receives an AN
+page, symbol error or false carrier, logging and masking each event
+after its first occurrence. This is a temporary diagnostic, not a fix.
+
+---
+ drivers/net/dsa/mv88e6xxx/pcs-639x.c | 94 +++++++++++++++++++++++++++++++---
+ 1 file changed, 91 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/dsa/mv88e6xxx/pcs-639x.c
++++ b/drivers/net/dsa/mv88e6xxx/pcs-639x.c
+@@ -9,6 +9,11 @@
+ #include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
+ #include <linux/mii.h>
++#include <linux/debugfs.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/uaccess.h>
+ #include <linux/string_choices.h>
+ 
+ #include "chip.h"
+@@ -21,9 +26,12 @@ struct mv88e639x_pcs {
+ 	struct mdio_device mdio;
+ 	struct phylink_pcs sgmii_pcs;
+ 	struct phylink_pcs xg_pcs;
++	struct dentry *restart_an_file;
++	u16 rx_events_seen;
+ 	bool erratum_3_14;
+ 	bool supports_5g;
+ 	phy_interface_t interface;
++	unsigned int port;
+ 	unsigned int irq;
+ 	char name[64];
+ 	irqreturn_t (*handle_irq)(struct mv88e639x_pcs *mpcs);
+@@ -60,6 +68,36 @@ static int mv88e639x_modify_changed(struct mv88e639x_pcs *mpcs, u16 regnum,
+ 					  mask, set);
+ }
+ 
++static ssize_t mv88e639x_pcs_restart_an_write(struct file *file,
++					    const char __user *user_buf,
++					    size_t count, loff_t *ppos)
++{
++	struct mv88e639x_pcs *mpcs = file->private_data;
++	char buf[2];
++	int err;
++
++	if (*ppos || !count || count > sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++	if (buf[0] != '1' || (count == 2 && buf[1] != '\n'))
++		return -EINVAL;
++
++	err = mv88e639x_modify(mpcs, MV88E6390_SGMII_BMCR,
++			       BMCR_ANRESTART, BMCR_ANRESTART);
++	if (err)
++		return err;
++
++	dev_info(mpcs->mdio.dev.parent,
++		 "MOX CPU PCS: userspace requested AN restart\n");
++	*ppos += count;
++	return count;
++}
++
++static const struct debugfs_short_fops mv88e639x_pcs_restart_an_fops = {
++	.write = mv88e639x_pcs_restart_an_write,
++};
++
+ static struct mv88e639x_pcs *
+ mv88e639x_pcs_alloc(struct device *dev, struct mii_bus *bus, unsigned int addr,
+ 		    int port)
+@@ -74,6 +112,7 @@ mv88e639x_pcs_alloc(struct device *dev, struct mii_bus *bus, unsigned int addr,
+ 	mpcs->mdio.dev.parent = dev;
+ 	mpcs->mdio.bus = bus;
+ 	mpcs->mdio.addr = addr;
++	mpcs->port = port;
+ 
+ 	snprintf(mpcs->name, sizeof(mpcs->name),
+ 		 "mv88e6xxx-%s-serdes-%d", dev_name(dev), port);
+@@ -119,6 +158,8 @@ static void mv88e639x_pcs_teardown(struct mv88e6xxx_chip *chip, int port)
+ 	if (!mpcs)
+ 		return;
+ 
++	debugfs_remove(mpcs->restart_an_file);
++
+ 	if (mpcs->irq)
+ 		free_irq(mpcs->irq, mpcs);
+ 
+@@ -135,33 +176,63 @@ static irqreturn_t mv88e639x_sgmii_handl
+ static irqreturn_t mv88e639x_sgmii_handle_irq(struct mv88e639x_pcs *mpcs)
+ {
+-	u16 int_status;
++	u16 int_status, events = 0;
+ 	int err;
+ 
+ 	err = mv88e639x_read(mpcs, MV88E6390_SGMII_INT_STATUS, &int_status);
+ 	if (err)
+ 		return IRQ_NONE;
+ 
++	if (mpcs->port == 9 &&
++	    of_machine_is_compatible("cznic,turris-mox") &&
++	    of_device_is_compatible(mpcs->mdio.dev.parent->of_node,
++				    "marvell,turris-mox-mv88e6190")) {
++		events = int_status & ~mpcs->rx_events_seen &
++			(MV88E6390_SGMII_INT_PAGE_RX |
++			 MV88E6390_SGMII_INT_SYMBOL_ERROR |
++			 MV88E6390_SGMII_INT_FALSE_CARRIER);
++		if (events) {
++			mpcs->rx_events_seen |= events;
++			err = mv88e639x_modify(mpcs, MV88E6390_SGMII_INT_ENABLE,
++						 events, 0);
++			dev_info(mpcs->mdio.dev.parent,
++				 "MOX CPU PCS RX events: status=%#x new=%#x mask_result=%d\n",
++				 int_status, events, err);
++		}
++	}
++
+ 	if (int_status & (MV88E6390_SGMII_INT_LINK_DOWN |
+ 			  MV88E6390_SGMII_INT_LINK_UP)) {
+ 		phylink_pcs_change(&mpcs->sgmii_pcs,
+ 				   int_status & MV88E6390_SGMII_INT_LINK_UP);
+ 
+ 		return IRQ_HANDLED;
+ 	}
+ 
+-	return IRQ_NONE;
++	return events ? IRQ_HANDLED : IRQ_NONE;
+ }
+ 
+ static int mv88e639x_sgmii_pcs_control_irq(struct mv88e639x_pcs *mpcs,
+ 					   bool enable)
+ {
++	u16 rx_event_mask = 0;
+ 	u16 val = 0;
+ 
++	if (mpcs->port == 9 &&
++	    of_machine_is_compatible("cznic,turris-mox") &&
++	    of_device_is_compatible(mpcs->mdio.dev.parent->of_node,
++				    "marvell,turris-mox-mv88e6190"))
++		rx_event_mask = MV88E6390_SGMII_INT_PAGE_RX |
++				MV88E6390_SGMII_INT_SYMBOL_ERROR |
++				MV88E6390_SGMII_INT_FALSE_CARRIER;
++
+ 	if (enable)
+ 		val |= MV88E6390_SGMII_INT_LINK_DOWN |
+ 		       MV88E6390_SGMII_INT_LINK_UP;
++	if (enable)
++		val |= rx_event_mask & ~mpcs->rx_events_seen;
+ 
+ 	return mv88e639x_modify(mpcs, MV88E6390_SGMII_INT_ENABLE,
+ 				MV88E6390_SGMII_INT_LINK_DOWN |
+-				MV88E6390_SGMII_INT_LINK_UP, val);
++				MV88E6390_SGMII_INT_LINK_UP |
++				rx_event_mask, val);
+ }
+@@ -325,6 +396,13 @@ static int mv88e639x_sgmii_pcs_config(st
+ 	if (err)
+ 		return err;
+ 
++	if (mpcs->port == 9 &&
++	    interface == PHY_INTERFACE_MODE_2500BASEX &&
++	    of_machine_is_compatible("cznic,turris-mox"))
++		dev_info(mpcs->mdio.dev.parent,
++			 "MOX switch PCS config: mode=%#x adv=%#x bmcr=%#x\n",
++			 neg_mode, adv, val);
++
+ 	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED)
+ 		bmcr = val | BMCR_ANENABLE;
+ 	else
+@@ -590,6 +668,16 @@ static int mv88e6390_pcs_init(struct mv88e6xxx_chip *chip, int port)
+ 
+ 	chip->ports[port].pcs_private = mpcs;
+ 
++	if (port == 9 && of_machine_is_compatible("cznic,turris-mox") &&
++	    of_device_is_compatible(dev->of_node,
++				    "marvell,turris-mox-mv88e6190")) {
++		mpcs->restart_an_file = debugfs_create_file(
++			"mox_switch0_cpu_pcs_restart_an", 0200, NULL, mpcs,
++			&mv88e639x_pcs_restart_an_fops);
++		if (IS_ERR_OR_NULL(mpcs->restart_an_file))
++			mpcs->restart_an_file = NULL;
++	}
++
+ 	return 0;
+ 
+ err_free:

@@ -1,0 +1,53 @@
+Subject: [PATCH] phy: mvebu-a3700: expose MOX COMPHY RX status for diagnosis
+
+Allow the live lane 0 RX initialization and PLL status to be read after
+eth1 reports CRC errors. This is a read-only temporary diagnostic patch.
+
+---
+ drivers/phy/marvell/phy-mvebu-a3700-comphy.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+--- a/drivers/phy/marvell/phy-mvebu-a3700-comphy.c
++++ b/drivers/phy/marvell/phy-mvebu-a3700-comphy.c
+@@ -16,3 +16,4 @@
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/debugfs.h>
+ #include <linux/io.h>
+@@ -24,3 +25,4 @@
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/seq_file.h>
+ #include <linux/spinlock.h>
+@@ -464,3 +466,24 @@
+ }
+ 
++static int mvebu_a3700_comphy_status_read(struct seq_file *s, void *data)
++{
++	struct device *dev = s->private;
++	struct mvebu_a3700_comphy_lane *lane = dev_get_drvdata(dev);
++	u32 cfg, status;
++
++	if (lane->id != 0)
++		return 0;
++
++	cfg = readl(lane->priv->comphy_regs +
++		    COMPHY_PHY_REG(lane->id, COMPHY_PHY_CFG1));
++	status = readl(lane->priv->comphy_regs +
++		       COMPHY_PHY_REG(lane->id, COMPHY_PHY_STAT1));
++	seq_printf(s, "lane=%u mode=%d submode=%d cfg1=%#x stat1=%#x rx_init_done=%u rx_pll_ready=%u tx_pll_ready=%u\n",
++		   lane->id, lane->mode, lane->submode, cfg, status,
++		   !!(status & PHY_RX_INIT_DONE_BIT),
++		   !!(status & PHY_PLL_READY_RX_BIT),
++		   !!(status & PHY_PLL_READY_TX_BIT));
++	return 0;
++}
++
+ /* PHY selector configures with corresponding modes */
+@@ -1342,4 +1365,6 @@
+ 		lane->invert_rx = false;
+ 		phy_set_drvdata(phy, lane);
++		debugfs_create_devm_seqfile(&phy->dev, "status", phy->debugfs,
++					    mvebu_a3700_comphy_status_read);
+ 
+ 		/*

@@ -1,0 +1,475 @@
+Subject: [PATCH] net: trace MOX MAC and switch PCS configuration sequence
+
+Trace the MOX CPU link callback order and register readbacks without
+changing negotiation, power sequencing or callback return values.
+Avoid extra BMSR and interrupt-status reads, which have latched state.
+Log bounded switch PCS state changes using already-read values.
+This is a temporary diagnostic, not a fix.
+
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -3720,6 +3720,25 @@
+ 	return phy_power_on(pp->comphy);
+ }
+ 
++static void mvneta_mox_trace(struct mvneta_port *pp, const char *event,
++			     phy_interface_t interface, unsigned int mode,
++			     int result)
++{
++	if (!of_machine_is_compatible("cznic,turris-mox") ||
++	    !phy_interface_mode_is_8023z(interface))
++		return;
++
++	netdev_info(pp->dev,
++		    "MOX sequence: %s interface=%s current=%s mode=%#x result=%d AN=%#x STATUS=%#x CTRL0=%#x CTRL2=%#x CTRL4=%#x CLOCK=%#x\n",
++		    event, phy_modes(interface), phy_modes(pp->phy_interface),
++		    mode, result, mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG),
++		    mvreg_read(pp, MVNETA_GMAC_STATUS),
++		    mvreg_read(pp, MVNETA_GMAC_CTRL_0),
++		    mvreg_read(pp, MVNETA_GMAC_CTRL_2),
++		    mvreg_read(pp, MVNETA_GMAC_CTRL_4),
++		    mvreg_read(pp, MVNETA_GMAC_CLOCK_DIVIDER));
++}
++
+ static int mvneta_config_interface(struct mvneta_port *pp,
+ 				   phy_interface_t interface)
+ {
+@@ -3740,6 +3759,8 @@ static int mvneta_config_interface(struct mvneta_port *pp,
+ {
+ 	int ret = 0;
+ 
++	mvneta_mox_trace(pp, "config_interface.before", interface, 0, 0);
++
+ 	if (pp->comphy) {
+ 		if (interface == PHY_INTERFACE_MODE_SGMII ||
+ 		    interface == PHY_INTERFACE_MODE_1000BASEX ||
+@@ -3770,7 +3791,8 @@ static int mvneta_config_interface(struct mvneta_port *pp,
+ 	}
+ 
+ 	pp->phy_interface = interface;
+ 
++	mvneta_mox_trace(pp, "config_interface.after", interface, 0, ret);
+ 	return ret;
+ }
+ 
+@@ -4060,6 +4082,8 @@ static int mvneta_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 	struct mvneta_port *pp = mvneta_pcs_to_port(pcs);
+ 	u32 mask, val, an, old_an, changed;
+ 
++	mvneta_mox_trace(pp, "pcs_config.before", interface, neg_mode, 0);
++
+ 	mask = MVNETA_GMAC_INBAND_AN_ENABLE |
+ 	       MVNETA_GMAC_INBAND_RESTART_AN |
+ 	       MVNETA_GMAC_AN_SPEED_EN |
+@@ -4110,6 +4134,9 @@ static int mvneta_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			    neg_mode, old_an, an,
+ 			    mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG));
+ 
++	mvneta_mox_trace(pp, "pcs_config.after", interface, neg_mode,
++			 !!(changed & MVNETA_GMAC_ADVERT_SYM_FLOW_CTRL));
++
+ 	/* We are only interested in the advertisement bits changing */
+ 	return !!(changed & MVNETA_GMAC_ADVERT_SYM_FLOW_CTRL);
+ }
+@@ -4120,6 +4147,8 @@ static void mvneta_pcs_an_restart(struct phylink_pcs *pcs)
+ 	struct mvneta_port *pp = mvneta_pcs_to_port(pcs);
+ 	u32 gmac_an = mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG);
+ 
++	mvneta_mox_trace(pp, "pcs_an_restart.before", pp->phy_interface, 0, 0);
++
+ 	mvreg_write(pp, MVNETA_GMAC_AUTONEG_CONFIG,
+ 		    gmac_an | MVNETA_GMAC_INBAND_RESTART_AN);
+ 	mvreg_write(pp, MVNETA_GMAC_AUTONEG_CONFIG,
+@@ -4127,4 +4156,5 @@ static void mvneta_pcs_an_restart(struct phylink_pcs *pcs)
+ 		    gmac_an & ~MVNETA_GMAC_INBAND_RESTART_AN);
++	mvneta_mox_trace(pp, "pcs_an_restart.after", pp->phy_interface, 0, 0);
+ }
+ 
+ static const struct phylink_pcs_ops mvneta_phylink_pcs_ops = {
+@@ -4150,6 +4180,8 @@ static int mvneta_mac_prepare(struct phylink_config *config, unsigned int mode,
+ 	struct mvneta_port *pp = netdev_priv(ndev);
+ 	u32 val;
+ 
++	mvneta_mox_trace(pp, "mac_prepare.before", interface, mode, 0);
++
+ 	if (pp->phy_interface != interface ||
+ 	    phylink_autoneg_inband(mode)) {
+ 		/* Force the link down when changing the interface or if in
+@@ -4178,6 +4210,7 @@ static int mvneta_mac_prepare(struct phylink_config *config, unsigned int mode,
+ 			    MVNETA_GMAC_1MS_CLOCK_ENABLE | (rate / 1000));
+ 	}
+ 
++	mvneta_mox_trace(pp, "mac_prepare.after", interface, mode, 0);
+ 	return 0;
+ }
+ 
+@@ -4190,6 +4223,8 @@ static void mvneta_mac_config(struct phylink_config *config, unsigned int mode,
+ 	u32 new_ctrl2, gmac_ctrl2 = mvreg_read(pp, MVNETA_GMAC_CTRL_2);
+ 	u32 new_ctrl4, gmac_ctrl4 = mvreg_read(pp, MVNETA_GMAC_CTRL_4);
+ 
++	mvneta_mox_trace(pp, "mac_config.before", state->interface, mode, 0);
++
+ 	new_ctrl0 = gmac_ctrl0 & ~MVNETA_GMAC0_PORT_1000BASE_X;
+ 	new_ctrl2 = gmac_ctrl2 & ~(MVNETA_GMAC2_INBAND_AN_ENABLE |
+ 				   MVNETA_GMAC2_PORT_RESET);
+@@ -4240,6 +4275,7 @@ static void mvneta_mac_config(struct phylink_config *config, unsigned int mode,
+ 			MVNETA_GMAC2_PORT_RESET) != 0)
+ 			continue;
+ 	}
++	mvneta_mox_trace(pp, "mac_config.after", state->interface, mode, 0);
+ }
+ 
+ static int mvneta_mac_finish(struct phylink_config *config, unsigned int mode,
+@@ -4252,6 +4288,8 @@ static int mvneta_mac_finish(struct phylink_config *config, unsigned int mode,
+ 	struct mvneta_port *pp = netdev_priv(ndev);
+ 	u32 val, clk;
+ 
++	mvneta_mox_trace(pp, "mac_finish.before", interface, mode, 0);
++
+ 	/* Disable 1ms clock if not in in-band mode */
+ 	if (!phylink_autoneg_inband(mode)) {
+ 		clk = mvreg_read(pp, MVNETA_GMAC_CLOCK_DIVIDER);
+@@ -4272,6 +4310,7 @@ static int mvneta_mac_finish(struct phylink_config *config, unsigned int mode,
+ 		mvreg_write(pp, MVNETA_GMAC_AUTONEG_CONFIG, val);
+ 	}
+ 
++	mvneta_mox_trace(pp, "mac_finish.after", interface, mode, 0);
+ 	return 0;
+ }
+ 
+@@ -4285,6 +4324,7 @@ static void mvneta_mac_link_down(struct phylink_config *config,
+ 	struct mvneta_port *pp = netdev_priv(ndev);
+ 	u32 val;
+ 
++	mvneta_mox_trace(pp, "mac_link_down.before", interface, mode, 0);
+ 	mvneta_port_down(pp);
+ 
+ 	if (!phylink_autoneg_inband(mode)) {
+@@ -4294,6 +4334,7 @@ static void mvneta_mac_link_down(struct phylink_config *config,
+ 		val |= MVNETA_GMAC_FORCE_LINK_DOWN;
+ 		mvreg_write(pp, MVNETA_GMAC_AUTONEG_CONFIG, val);
+ 	}
++	mvneta_mox_trace(pp, "mac_link_down.after", interface, mode, 0);
+ }
+ 
+ static void mvneta_mac_link_up(struct phylink_config *config,
+@@ -4290,6 +4331,8 @@ static void mvneta_mac_link_up(struct phylink_config *config,
+ 	struct mvneta_port *pp = netdev_priv(ndev);
+ 	u32 val;
+ 
++	mvneta_mox_trace(pp, "mac_link_up.before", interface, mode, 0);
++
+ 	if (!phylink_autoneg_inband(mode)) {
+ 		val = mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG);
+ 		val &= ~(MVNETA_GMAC_FORCE_LINK_DOWN |
+@@ -4328,6 +4371,7 @@ static void mvneta_mac_link_up(struct phylink_config *config,
+ 	}
+ 
+ 	mvneta_port_up(pp);
++	mvneta_mox_trace(pp, "mac_link_up.after", interface, mode, 0);
+ 
+ 	if (of_machine_is_compatible("cznic,turris-mox") &&
+ 	    interface == PHY_INTERFACE_MODE_2500BASEX)
+--- a/drivers/net/dsa/mv88e6xxx/pcs-639x.c
++++ b/drivers/net/dsa/mv88e6xxx/pcs-639x.c
+@@ -30,5 +30,9 @@ struct mv88e639x_pcs {
+ 	struct dentry *restart_an_file;
+ 	u16 rx_events_seen;
++	u8 mox_state_samples;
++	u16 mox_last_bmsr;
++	u16 mox_last_lpa;
++	u16 mox_last_status;
+ 	bool erratum_3_14;
+ 	bool supports_5g;
+ 	phy_interface_t interface;
+@@ -70,6 +74,35 @@ static int mv88e639x_modify_changed(struct mv88e639x_pcs *mpcs, u16 regnum,
+ 					  mask, set);
+ }
+ 
++static void mv88e639x_mox_trace(struct mv88e639x_pcs *mpcs,
++			       const char *event, phy_interface_t interface,
++			       int result)
++{
++	u16 bmcr, adv, status;
++	int err;
++
++	if (mpcs->port != 9 ||
++	    !of_machine_is_compatible("cznic,turris-mox") ||
++	    !of_device_is_compatible(mpcs->mdio.dev.parent->of_node,
++				     "marvell,turris-mox-mv88e6190"))
++		return;
++
++	err = mv88e639x_read(mpcs, MV88E6390_SGMII_BMCR, &bmcr);
++	if (!err)
++		err = mv88e639x_read(mpcs, MV88E6390_SGMII_ADVERTISE, &adv);
++	if (!err)
++		err = mv88e639x_read(mpcs, MV88E6390_SGMII_PHY_STATUS, &status);
++	if (err) {
++		dev_info(mpcs->mdio.dev.parent,
++			 "MOX sequence: %s interface=%s result=%d read_error=%d\n",
++			 event, phy_modes(interface), result, err);
++		return;
++	}
++	dev_info(mpcs->mdio.dev.parent,
++		 "MOX sequence: %s interface=%s result=%d BMCR=%#x ADV=%#x PHY_STATUS=%#x\n",
++		 event, phy_modes(interface), result, bmcr, adv, status);
++}
++
+ static ssize_t mv88e639x_pcs_restart_an_write(struct file *file,
+ 					    const char __user *user_buf,
+ 					    size_t count, loff_t *ppos)
+@@ -240,5 +273,6 @@ static int mv88e639x_sgmii_pcs_control_pwr(struct mv88e639x_pcs *mpcs,
+ {
+ 	u16 mask, val;
++	int err;
+ 
+ 	if (enable) {
+ 		mask = BMCR_RESET | BMCR_LOOPBACK | BMCR_PDOWN;
+@@ -251,7 +285,12 @@ static int mv88e639x_sgmii_pcs_control_pwr(struct mv88e639x_pcs *mpcs,
+ 		mask = val = BMCR_PDOWN;
+ 	}
+ 
+-	return mv88e639x_modify(mpcs, MV88E6390_SGMII_BMCR, mask, val);
++	mv88e639x_mox_trace(mpcs, enable ? "pcs_power_on.before" :
++			    "pcs_power_off.before", mpcs->interface, 0);
++	err = mv88e639x_modify(mpcs, MV88E6390_SGMII_BMCR, mask, val);
++	mv88e639x_mox_trace(mpcs, enable ? "pcs_power_on.after" :
++			    "pcs_power_off.after", mpcs->interface, err);
++	return err;
+ }
+ 
+ static int mv88e639x_sgmii_pcs_enable(struct phylink_pcs *pcs)
+@@ -260,10 +299,14 @@ static int mv88e639x_sgmii_pcs_enable(struct phylink_pcs *pcs)
+ {
+ 	struct mv88e639x_pcs *mpcs = sgmii_pcs_to_mv88e639x_pcs(pcs);
++	int err;
+ 
++	mv88e639x_mox_trace(mpcs, "pcs_enable.before", mpcs->interface, 0);
+ 	/* power enable done in post_config */
+ 	mpcs->handle_irq = mv88e639x_sgmii_handle_irq;
+ 
+-	return mv88e639x_sgmii_pcs_control_irq(mpcs, !!mpcs->irq);
++	err = mv88e639x_sgmii_pcs_control_irq(mpcs, !!mpcs->irq);
++	mv88e639x_mox_trace(mpcs, "pcs_enable.after", mpcs->interface, err);
++	return err;
+ }
+ 
+ static void mv88e639x_sgmii_pcs_disable(struct phylink_pcs *pcs)
+@@ -273,7 +316,9 @@ static void mv88e639x_sgmii_pcs_disable(struct phylink_pcs *pcs)
+ {
+ 	struct mv88e639x_pcs *mpcs = sgmii_pcs_to_mv88e639x_pcs(pcs);
+ 
++	mv88e639x_mox_trace(mpcs, "pcs_disable.before", mpcs->interface, 0);
+ 	mv88e639x_sgmii_pcs_control_irq(mpcs, false);
+ 	mv88e639x_sgmii_pcs_control_pwr(mpcs, false);
++	mv88e639x_mox_trace(mpcs, "pcs_disable.after", mpcs->interface, 0);
+ }
+ 
+@@ -285,6 +330,8 @@ static void mv88e639x_sgmii_pcs_pre_config(struct phylink_pcs *pcs,
+ 	struct mv88e639x_pcs *mpcs = sgmii_pcs_to_mv88e639x_pcs(pcs);
+ 
++	mv88e639x_mox_trace(mpcs, "pcs_pre_config.before", interface, 0);
+ 	mv88e639x_sgmii_pcs_control_pwr(mpcs, false);
++	mv88e639x_mox_trace(mpcs, "pcs_pre_config.after", interface, 0);
+ }
+ 
+ static int mv88e6390_erratum_3_14(struct mv88e639x_pcs *mpcs)
+@@ -330,6 +377,7 @@ static int mv88e639x_sgmii_pcs_post_config(struct phylink_pcs *pcs,
+ 	struct mv88e639x_pcs *mpcs = sgmii_pcs_to_mv88e639x_pcs(pcs);
+ 	int err;
+ 
++	mv88e639x_mox_trace(mpcs, "pcs_post_config.before", interface, 0);
+ 	mv88e639x_sgmii_pcs_control_pwr(mpcs, true);
+ 
+ 	if (mpcs->erratum_3_14) {
+@@ -341,6 +389,7 @@ static int mv88e639x_sgmii_pcs_post_config(struct phylink_pcs *pcs,
+ 				ERR_PTR(err));
+ 	}
+ 
++	mv88e639x_mox_trace(mpcs, "pcs_post_config.after", interface, 0);
+ 	return 0;
+ }
+ 
+@@ -380,6 +429,21 @@ static void mv88e639x_sgmii_pcs_get_state(struct phylink_pcs *pcs,
+ 		return;
+ 	}
+ 
++	if (mpcs->port == 9 &&
++	    of_machine_is_compatible("cznic,turris-mox") &&
++	    of_device_is_compatible(mpcs->mdio.dev.parent->of_node,
++				     "marvell,turris-mox-mv88e6190") &&
++	    mpcs->mox_state_samples < 8 &&
++	    (!mpcs->mox_state_samples || mpcs->mox_last_bmsr != bmsr ||
++	     mpcs->mox_last_lpa != lpa || mpcs->mox_last_status != status)) {
++		mpcs->mox_state_samples++;
++		mpcs->mox_last_bmsr = bmsr;
++		mpcs->mox_last_lpa = lpa;
++		mpcs->mox_last_status = status;
++		dev_info(mpcs->mdio.dev.parent,
++			 "MOX switch PCS state: mode=%#x BMSR=%#x LPA=%#x PHY_STATUS=%#x\n",
++			 neg_mode, bmsr, lpa, status);
++	}
+ 	mv88e6xxx_pcs_decode_state(mpcs->mdio.dev.parent, bmsr, lpa, status,
+ 				   state);
+ }
+@@ -402,5 +466,7 @@ static int mv88e639x_sgmii_pcs_config(struct phylink_pcs *pcs,
+ 	int adv, err;
+ 
++	mv88e639x_mox_trace(mpcs, "pcs_config.before", interface, 0);
++	mpcs->mox_state_samples = 0;
+ 	adv = phylink_mii_c22_pcs_encode_advertisement(interface, advertising);
+ 	if (adv < 0)
+ 		return 0;
+@@ -441,8 +507,12 @@ static int mv88e639x_sgmii_pcs_config(struct phylink_pcs *pcs,
+ 	/* setting ANENABLE triggers a restart of negotiation */
+-	if (bmcr == val)
++	if (bmcr == val) {
++		mv88e639x_mox_trace(mpcs, "pcs_config.after", interface, changed);
+ 		return changed;
++	}
+ 
+-	return mv88e639x_write(mpcs, MV88E6390_SGMII_BMCR, bmcr);
++	err = mv88e639x_write(mpcs, MV88E6390_SGMII_BMCR, bmcr);
++	mv88e639x_mox_trace(mpcs, "pcs_config.after", interface, err);
++	return err;
+ }
+ 
+ static void mv88e639x_sgmii_pcs_an_restart(struct phylink_pcs *pcs)
+@@ -454,8 +524,11 @@ static void mv88e639x_sgmii_pcs_an_restart(struct phylink_pcs *pcs)
+ {
+ 	struct mv88e639x_pcs *mpcs = sgmii_pcs_to_mv88e639x_pcs(pcs);
++	int err;
+ 
+-	mv88e639x_modify(mpcs, MV88E6390_SGMII_BMCR,
+-			 BMCR_ANRESTART, BMCR_ANRESTART);
++	mv88e639x_mox_trace(mpcs, "pcs_an_restart.before", mpcs->interface, 0);
++	err = mv88e639x_modify(mpcs, MV88E6390_SGMII_BMCR,
++			       BMCR_ANRESTART, BMCR_ANRESTART);
++	mv88e639x_mox_trace(mpcs, "pcs_an_restart.after", mpcs->interface, err);
+ }
+ 
+ static void mv88e639x_sgmii_pcs_link_up(struct phylink_pcs *pcs,
+--- a/drivers/net/dsa/mv88e6xxx/chip.c
++++ b/drivers/net/dsa/mv88e6xxx/chip.c
+@@ -877,6 +877,34 @@
+ 	return pcs;
+ }
+ 
++static void mv88e6xxx_mox_mac_trace(struct mv88e6xxx_chip *chip, int port,
++				   const char *event, unsigned int mode,
++				   phy_interface_t interface, int result)
++{
++	u16 status, mac;
++	int err;
++
++	if (port != 9 || !of_machine_is_compatible("cznic,turris-mox") ||
++	    !of_device_is_compatible(chip->dev->of_node,
++				     "marvell,turris-mox-mv88e6190"))
++		return;
++
++	mv88e6xxx_reg_lock(chip);
++	err = mv88e6xxx_port_read(chip, port, MV88E6XXX_PORT_STS, &status);
++	if (!err)
++		err = mv88e6xxx_port_read(chip, port, MV88E6XXX_PORT_MAC_CTL, &mac);
++	mv88e6xxx_reg_unlock(chip);
++	if (err) {
++		dev_info(chip->dev, "MOX sequence: switch_%s result=%d read_error=%d\n",
++			 event, result, err);
++		return;
++	}
++	dev_info(chip->dev,
++		 "MOX sequence: switch_%s interface=%s current=%s mode=%#x result=%d PORT_STATUS=%#x MAC_CTL=%#x\n",
++		 event, phy_modes(interface), phy_modes(chip->ports[port].interface),
++		 mode, result, status, mac);
++}
++
+ static int mv88e6xxx_mac_prepare(struct phylink_config *config,
+ 				 unsigned int mode, phy_interface_t interface)
+ {
+@@ -887,6 +915,8 @@ static int mv88e6xxx_mac_prepare(struct phylink_config *config,
+ 	int port = dp->index;
+ 	int err = 0;
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_prepare.before", mode, interface, 0);
++
+ 	/* In inband mode, the link may come up at any time while the link
+ 	 * is not forced down. Force the link down while we reconfigure the
+ 	 * interface mode.
+@@ -900,6 +930,7 @@ static int mv88e6xxx_mac_prepare(struct phylink_config *config,
+ 		mv88e6xxx_reg_unlock(chip);
+ 	}
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_prepare.after", mode, interface, err);
+ 	return err;
+ }
+ 
+@@ -911,6 +942,8 @@ static void mv88e6xxx_mac_config(struct phylink_config *config,
+ 	int port = dp->index;
+ 	int err = 0;
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_config.before", mode,
++			       state->interface, 0);
+ 	mv88e6xxx_reg_lock(chip);
+ 
+ 	if (mode != MLO_AN_PHY || !mv88e6xxx_phy_is_internal(chip, port)) {
+@@ -924,6 +957,8 @@ static void mv88e6xxx_mac_config(struct phylink_config *config,
+ err_unlock:
+ 	mv88e6xxx_reg_unlock(chip);
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_config.after", mode,
++			       state->interface, err);
+ 	if (err && err != -EOPNOTSUPP)
+ 		dev_err(chip->dev, "p%d: failed to configure MAC/PCS\n", port);
+ }
+@@ -936,6 +971,8 @@ static int mv88e6xxx_mac_finish(struct phylink_config *config,
+ 	int port = dp->index;
+ 	int err = 0;
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_finish.before", mode, interface, 0);
++
+ 	/* Undo the forced down state above after completing configuration
+ 	 * irrespective of its state on entry, which allows the link to come
+ 	 * up in the in-band case where there is no separate SERDES. Also
+@@ -955,5 +992,6 @@ static int mv88e6xxx_mac_finish(struct phylink_config *config,
+ 
+ 	chip->ports[port].interface = interface;
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_finish.after", mode, interface, err);
+ 	return err;
+ }
+@@ -969,6 +1007,8 @@ static void mv88e6xxx_mac_link_down(struct phylink_config *config,
+ 	int port = dp->index;
+ 	int err = 0;
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_link_down.before", mode, interface, 0);
++
+ 	ops = chip->info->ops;
+ 
+ 	mv88e6xxx_reg_lock(chip);
+@@ -981,6 +1021,8 @@ static void mv88e6xxx_mac_link_down(struct phylink_config *config,
+ 						 DUPLEX_UNFORCED);
+ 	mv88e6xxx_reg_unlock(chip);
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_link_down.after", mode, interface, err);
++
+ 	if (err)
+ 		dev_err(chip->dev,
+ 			"p%d: failed to force MAC link down\n", port);
+@@ -1000,6 +1042,8 @@ static void mv88e6xxx_mac_link_up(struct phylink_config *config,
+ 	int port = dp->index;
+ 	int err = 0;
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_link_up.before", mode, interface, 0);
++
+ 	ops = chip->info->ops;
+ 
+ 	mv88e6xxx_reg_lock(chip);
+@@ -1025,6 +1069,8 @@ static void mv88e6xxx_mac_link_up(struct phylink_config *config,
+ error:
+ 	mv88e6xxx_reg_unlock(chip);
+ 
++	mv88e6xxx_mox_mac_trace(chip, port, "mac_link_up.after", mode, interface, err);
++
+ 	if (err && err != -EOPNOTSUPP)
+ 		dev_err(chip->dev,
+ 			"p%d: failed to configure MAC link up\n", port);

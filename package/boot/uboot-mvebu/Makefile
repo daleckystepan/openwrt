@@ -24,7 +24,6 @@ endef
 
 define U-Boot/mox
   NAME:=CZ.NIC Turris Mox
-  BUILD_DEVICES:=cznic_turris-mox
   BUILD_SUBTARGET:=cortexa53
   UBOOT_CONFIG:=turris_mox
 endef
